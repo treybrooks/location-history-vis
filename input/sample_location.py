@@ -1,68 +1,75 @@
-import json
-import pandas as pd
-import datetime
-from shapely.geometry import Point, shape
+from datetime import datetime, timezone
+import polars as pl
+import polars.selectors as cs
+import numpy as np
+import geopandas as gpd
+from shapely.geometry import Point
+import ijson
+import mmap
+import time
 
-def gps_to_country(longitude, latitude, geo_json):
-    point = Point(longitude, latitude)
+DATA_PATH = "Records.json"
+GEOJSON_PATH = "geojson/ne_50m_admin_0_countries.geojson"
 
-    for record in geo_json['features']:
-        polygon = shape(record['geometry'])
-        if polygon.contains(point):
-            return record['properties']['name']
-    return 'other'
+def get_countries(df, granularity=2):
+    print("Labeling country data...")
+    start_time = time.time()
+    # round lat/long and convert to Points for geometry comparison
+    df = df.with_columns([
+        pl.col('lat').round(granularity).alias('lat_round'),
+        pl.col('lon').round(granularity).alias('lon_round')
+    ])
 
-def get_countries(df, geojson_name, granularity=2):
-    # create low granularity groups and look up countries
-    # would be very slow and unnecessary to do this for every record
-    df['lat_round'] = df.lat.apply(lambda x: round(x, granularity))
-    df['lon_round'] = df.lon.apply(lambda x: round(x, granularity))
-    groups = pd.concat([df['lat_round'], df['lon_round']], axis=1).drop_duplicates()
-    with open('geojson/%s' % geojson_name) as data_file:
-        geo_json = json.load(data_file)
-    groups['country'] = groups.apply(lambda row: gps_to_country(row['lon_round'], row['lat_round'], geo_json), axis=1)
-    df = df.merge(groups, how='left', on=['lat_round', 'lon_round'])
-    df.drop('lon_round', axis=1, inplace=True)
-    df.drop('lat_round', axis=1, inplace=True)
-    df = df[df.country!='other']
+    # Collect unique rounded points and make them Geo savvy
+    unique_df = df.select(['lat_round', 'lon_round']).unique().to_pandas()
+    unique_df['geometry'] = [Point(*p) for p in tuple(zip(unique_df['lon_round'], unique_df['lat_round']))]
+    unique_gdf = gpd.GeoDataFrame(unique_df, crs=4326)
+
+    # Load Country GeoData and join to unique points
+    countries = gpd.read_file(GEOJSON_PATH)
+    labeled_gdf = gpd.sjoin(unique_gdf, countries, how='inner')
+    labeled_gdf['country'] = labeled_gdf['name']
+
+    # Convert to Polars and join labeled back to original data
+    country_df = pl.from_pandas(labeled_gdf[['lat_round', 'lon_round', 'country']])
+    df = df.join(country_df, on=['lat_round', 'lon_round'], how='left')
+
+    end_time = time.time()
+    print(f"Labeling completed in {end_time - start_time:.2f} seconds.")
+    # filter useless rows and drop now unnessesary colummns
+    return df.filter(pl.col('country') != 'other').drop(['lat_round', 'lon_round'])
+
+def clean_location_data():
+    print("Starting to process the data...")
+    start_time = time.time()
+
+    # Get total number of records
+    with open(DATA_PATH, 'rb') as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        locations = ijson.items(mm, 'locations.item')
+        df = pl.DataFrame(locations)
+    
+    # little formatting and select only the important columns
+    df = df.select([
+        (pl.col('latitudeE7').cast(pl.Float64) / 1e7).alias('lat'),
+        (pl.col('longitudeE7').cast(pl.Float64) / 1e7).alias('lon'),
+        (pl.col('timestamp').str.to_datetime()).alias('time')
+    ]).drop_nulls(subset=cs.float())
+
+    end_time = time.time()
+    print(f"Ingestion completed in {end_time - start_time:.2f} seconds.")
     return df
 
-def sample(df, frac, granularity=3):
-    # sample data within granular groups
-    df['lat_round'] = df.lat.apply(lambda x: round(x, granularity))
-    df['lon_round'] = df.lon.apply(lambda x: round(x, granularity))
-    df_sample = pd.DataFrame()
-    max_records = len(df)/100 # ensure no more than 1% of records from any single location
-    print "Sampling location groups.."
-    for _, location in df.groupby(['lat_round', 'lon_round']):
-        if len(location) < 10:
-            sample = location #keep all of small groups
-        else:
-            sample = location.sample(n=min(max_records, int(len(location)*frac)))
-        df_sample = pd.concat([df_sample, sample])
-    return df_sample
-
-def clean_location_data(sample_frac=0.05):
-    with open('LocationHistory.json') as data_file:
-        locations = json.load(data_file)['locations']
-    df = pd.DataFrame.from_dict(locations)
-    print "Raw data as %d records." % len(df)
-    # convert to regular gps coordinates
-    df['lat'] = df.latitudeE7/1e7
-    df['lon'] = df.longitudeE7/1e7
-
-    # convert timestamp to human readable form
-    df['time'] = df.timestampMs.apply(
-        lambda x: datetime.datetime.fromtimestamp(float(x)/1000).strftime('%Y-%m-%d %H:%M:%S'))
-
-
-    df = get_countries(df, 'ne_50m_admin_0_countries.geojson')
-
-    df_sample = sample(df, sample_frac)[['time','lat','lon','country']]
-
-    final_json = df_sample.to_json(orient='records')
-    with open('location_sample.json', 'w') as outfile:
-        json.dump(final_json, outfile)
-
 if __name__ == "__main__":
-    clean_location_data(sample_frac=0.05)
+    df = clean_location_data()
+    
+    df = get_countries(df)
+    
+    df = df.sample(fraction=0.05, seed=0)
+
+    # Filter by date if you like
+    # df = df.filter(pl.col('time') >= datetime(2020, 1, 1).replace(tzinfo=timezone.utc))
+
+    # Convert time column to what the graph expects
+    df = df.with_columns([(pl.col('time').dt.strftime("%Y-%m-%d %H:%M:%S"))])
+    df.write_json('location_sample.json')
